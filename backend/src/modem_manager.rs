@@ -17,6 +17,7 @@ use zbus::{
 use crate::{
     config::{ApnConfig, ConfigManager},
     db::Database,
+    kwrt_network::{self, KwrtNetworkConfig, NetworkTransport},
 };
 use crate::{
     models::{
@@ -89,8 +90,7 @@ type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperti
 static MODEM_DISCOVERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static MODEM_DISCOVERY_FAILURE: std::sync::Mutex<Option<(Instant, String)>> =
     std::sync::Mutex::new(None);
-static LAST_MODEM_AUTO_RECOVERY: std::sync::Mutex<Option<Instant>> =
-    std::sync::Mutex::new(None);
+static LAST_MODEM_AUTO_RECOVERY: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 const MODEM_AUTO_RECOVERY_COOLDOWN_SECS: u64 = 180;
 static BASEBAND_RESTART_STEPS: std::sync::Mutex<Vec<BasebandRestartStep>> =
     std::sync::Mutex::new(Vec::new());
@@ -1104,6 +1104,9 @@ fn clear_modem_discovery_failure() {
 
 #[cfg(unix)]
 pub async fn try_recover_stuck_modem(reason: &str) -> bool {
+    if crate::platform::is_openwrt() {
+        return false;
+    }
     let should_run = {
         let Ok(mut guard) = LAST_MODEM_AUTO_RECOVERY.lock() else {
             return false;
@@ -1184,8 +1187,10 @@ pub async fn try_recover_stuck_modem(_reason: &str) -> bool {
     false
 }
 
-
 pub async fn find_modem_path(conn: &Connection) -> zbus::Result<String> {
+    if crate::platform::is_openwrt() {
+        return find_kwrt_modem_path(conn).await;
+    }
     if let Some(path) = list_modem_paths(conn).await?.into_iter().next() {
         clear_modem_discovery_failure();
         return Ok(path);
@@ -1721,6 +1726,9 @@ async fn send_at_via_modem_command(
     modem_path: &str,
     command: &str,
 ) -> Result<String, String> {
+    if crate::platform::is_openwrt() {
+        return with_serial(async { kwrt_mm_at(conn, modem_path, command).await }).await;
+    }
     // 动态提权到 DEBUG 模式
     let mm_proxy = Proxy::new(
         conn,
@@ -2031,6 +2039,29 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
         .network_info()
         .await
         .map_err(shared_runtime_error)?;
+    if crate::platform::is_openwrt() {
+        let transport = KwrtTransport { conn, modem_path: &modem_path };
+        let live = with_serial(async {
+            let serving = kwrt_network::serving_network(&transport).await?;
+            let quality = if data.signal_strength == 0 {
+                transport.at("AT+CSQ").await.ok()
+                    .and_then(|response| simadmin_device_runtime::parse_csq_percentage(&response))
+            } else { None };
+            Ok::<_, String>((serving, quality))
+        }).await;
+        match live {
+            Ok((serving, quality)) => {
+                data.operator_name = serving.operator_name;
+                data.registration_status = if serving.roaming { "roaming" } else { "registered" }.into();
+                data.technology_preference = serving.technology;
+                let (mcc, mnc) = split_operator_code(&serving.plmn);
+                data.mcc = Some(mcc);
+                data.mnc = Some(mnc);
+                if let Some(quality) = quality { data.signal_strength = quality; }
+            }
+            Err(error) => warn!(%error, "RG200U serving network could not be confirmed"),
+        }
+    }
     data.operator_name = localize_operator_display(
         data.mcc.as_deref().unwrap_or_default(),
         data.mnc.as_deref().unwrap_or_default(),
@@ -2045,7 +2076,7 @@ pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInf
         .and_then(|value| <(u32, bool)>::try_from(value.clone()).ok())
         .map(|(q, _)| q)
         .unwrap_or(0);
-    if dbus_quality == 0 && matches!(data.registration_status.as_str(), "registered" | "roaming") {
+    if !crate::platform::is_openwrt() && dbus_quality == 0 && matches!(data.registration_status.as_str(), "registered" | "roaming") {
         poke_signal_quality_if_needed();
     }
 
@@ -2792,7 +2823,10 @@ LTE Timing Advance: 'unavailable'"#;
         .unwrap();
 
         // Current SIM does not match, but should fall back to latest historical SMSC
-        assert_eq!(cached_smsc_or_latest(&db, Some(&identity)), "+8613800100500");
+        assert_eq!(
+            cached_smsc_or_latest(&db, Some(&identity)),
+            "+8613800100500"
+        );
 
         // When identity is None, should also fall back to latest
         assert_eq!(cached_smsc_or_latest(&db, None), "+8613800100500");
@@ -2807,7 +2841,10 @@ LTE Timing Advance: 'unavailable'"#;
             "test",
         )
         .unwrap();
-        assert_eq!(cached_smsc_or_latest(&db, Some(&identity)), "+8613800200500");
+        assert_eq!(
+            cached_smsc_or_latest(&db, Some(&identity)),
+            "+8613800200500"
+        );
     }
 
     #[test]
@@ -3516,7 +3553,10 @@ async fn enrich_cells_via_at(
             for line in resp.lines() {
                 if let Some(pos) = line.find("+MUESTATS:") {
                     let text = &line[pos + 10..];
-                    let parts: Vec<&str> = text.split(',').map(|s| s.trim().trim_matches('"')).collect();
+                    let parts: Vec<&str> = text
+                        .split(',')
+                        .map(|s| s.trim().trim_matches('"'))
+                        .collect();
                     if parts.len() >= 2 && parts[0] == "sband" {
                         let b = parts[1];
                         if !b.is_empty() {
@@ -3539,12 +3579,18 @@ async fn enrich_cells_via_at(
         if let Some(resp) = send_mm_at_command(&proxy, "AT+QNWINFO").await {
             if let Some(line) = resp.lines().find(|l| l.contains("+QNWINFO:")) {
                 let text = line.split(':').nth(1).unwrap_or("");
-                let parts: Vec<&str> = text.split(',').map(|s| s.trim().trim_matches('"')).collect();
+                let parts: Vec<&str> = text
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"'))
+                    .collect();
                 if parts.len() >= 4 {
                     let band_str = parts[2];
                     if serving.band.is_empty() {
                         if let Some(pos) = band_str.find("BAND") {
-                            let b_digits: String = band_str[pos + 4..].chars().filter(char::is_ascii_digit).collect();
+                            let b_digits: String = band_str[pos + 4..]
+                                .chars()
+                                .filter(char::is_ascii_digit)
+                                .collect();
                             if !b_digits.is_empty() {
                                 serving.band = format!("B{b_digits}");
                             }
@@ -3552,8 +3598,12 @@ async fn enrich_cells_via_at(
                     }
                     let earfcn = parts[3];
                     if !earfcn.is_empty() {
-                        if serving.earfcn.is_empty() { serving.earfcn = earfcn.to_string(); }
-                        if serving.arfcn.is_empty() { serving.arfcn = earfcn.to_string(); }
+                        if serving.earfcn.is_empty() {
+                            serving.earfcn = earfcn.to_string();
+                        }
+                        if serving.arfcn.is_empty() {
+                            serving.arfcn = earfcn.to_string();
+                        }
                     }
                 }
             }
@@ -3571,7 +3621,10 @@ async fn enrich_cells_via_at(
 
     // 6. Ensure neighbor cells have band populated if matching serving cell
     for cell in extra_cells.iter_mut() {
-        if cell.band.is_empty() && !serving.band.is_empty() && (cell.earfcn.is_empty() || cell.earfcn == serving.earfcn) {
+        if cell.band.is_empty()
+            && !serving.band.is_empty()
+            && (cell.earfcn.is_empty() || cell.earfcn == serving.earfcn)
+        {
             cell.band = serving.band.clone();
         }
     }
@@ -3635,14 +3688,25 @@ async fn get_cells_data_mmcli_fallback(
     let mut extra_cells = Vec::new();
 
     if serving.band.is_empty() || serving.pci.is_empty() || serving.arfcn.is_empty() {
-        enrich_cells_via_at(conn, modem_path, &mut serving_cell, &mut serving, &mut extra_cells).await;
+        enrich_cells_via_at(
+            conn,
+            modem_path,
+            &mut serving_cell,
+            &mut serving,
+            &mut extra_cells,
+        )
+        .await;
     }
 
     if serving.cell_id == 0 && serving_cell.cell_id != 0 {
         serving.cell_id = serving_cell.cell_id;
     }
 
-    if serving_cell.tac == 0 && serving_cell.cell_id == 0 && serving.arfcn.is_empty() && extra_cells.is_empty() {
+    if serving_cell.tac == 0
+        && serving_cell.cell_id == 0
+        && serving.arfcn.is_empty()
+        && extra_cells.is_empty()
+    {
         return Ok(CellsResponse::default());
     }
 
@@ -4062,10 +4126,7 @@ async fn read_bearer_simple_connect_settings(
         match get_all_properties(conn, &path, MM_BEARER).await {
             Ok(props) => {
                 let settings = simple_connect_settings_from_bearer_props(&props);
-                let is_special = settings
-                    .apn
-                    .as_deref()
-                    .is_some_and(is_isolated_special_apn);
+                let is_special = settings.apn.as_deref().is_some_and(is_isolated_special_apn);
                 if settings.has_apn() && !is_special {
                     return settings;
                 }
@@ -4324,6 +4385,11 @@ fn data_path_health_with_reason(
 /// former reports ModemManager's control plane while this validates that the
 /// profile has an up interface and an assigned address in Linux.
 pub async fn get_cellular_data_path_health(conn: &Connection) -> zbus::Result<DataPathHealth> {
+    if crate::platform::is_openwrt() {
+        return kwrt_data_health(conn)
+            .await
+            .map_err(|err| zbus::fdo::Error::Failed(err).into());
+    }
     let modem_path = find_modem_path(conn).await?;
     let state = modem_state(conn, &modem_path).await.unwrap_or(0);
     let control_plane_connected = state >= MM_MODEM_STATE_CONNECTED;
@@ -4393,6 +4459,27 @@ async fn set_data_connection_inner(
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
 ) -> zbus::Result<()> {
+    if crate::platform::is_openwrt() {
+        let config = KwrtNetworkConfig::from_env().map_err(zbus::fdo::Error::Failed)?;
+        let modem_path = find_modem_path(conn).await?;
+        kwrt_check_data_owner(conn, &modem_path)
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+        let transport = KwrtTransport {
+            conn,
+            modem_path: &modem_path,
+        };
+        let apn = configured_apn.cloned().unwrap_or_default();
+        return with_serial(kwrt_network::set_active(
+            &transport,
+            &config,
+            active,
+            allow_roaming,
+            &apn,
+        ))
+        .await
+        .map_err(|err| zbus::fdo::Error::Failed(err).into());
+    }
     with_serial(async {
         let profile = find_nm_modem_connection()
             .await
@@ -4511,6 +4598,11 @@ async fn set_data_connection_inner(
 }
 
 pub async fn get_data_connection_status(conn: &Connection) -> zbus::Result<bool> {
+    if crate::platform::is_openwrt() {
+        return Ok(get_cellular_data_path_health(conn)
+            .await?
+            .control_plane_connected);
+    }
     let modem_path = find_modem_path(conn).await?;
     Ok(ModemContext::new(conn, &modem_path)
         .map_err(shared_runtime_error)?
@@ -4556,6 +4648,15 @@ async fn disconnect_known_bearers(conn: &Connection, modem_path: &str) {
 
 /// 当前是否处于漫游注册态（与「是否允许漫游」无关，后者来自本地配置）。
 pub async fn get_is_roaming_mm(conn: &Connection) -> zbus::Result<bool> {
+    if crate::platform::is_openwrt() {
+        let path = find_modem_path(conn).await?;
+        return with_serial(kwrt_network::registered_roaming(&KwrtTransport {
+            conn,
+            modem_path: &path,
+        }))
+        .await
+        .map_err(|err| zbus::fdo::Error::Failed(err).into());
+    }
     let modem_path = find_modem_path(conn).await?;
     let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
     let reg_state = gpp_props
@@ -4917,13 +5018,7 @@ pub async fn get_signal_strength(conn: &Connection) -> zbus::Result<SignalStreng
             .unwrap_or(0);
         if matches!(reg_state, 1 | 5) {
             poke_signal_quality_if_needed();
-            let proxy = Proxy::new(
-                conn,
-                MM_SERVICE,
-                modem_path.as_str(),
-                MM_MODEM,
-            )
-            .await?;
+            let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM).await?;
             if let Some(resp) = send_mm_at_command(&proxy, "AT+CSQ").await {
                 if let Some(pct) = simadmin_device_runtime::parse_csq_percentage(&resp) {
                     strength = pct as i32;
@@ -5604,6 +5699,9 @@ pub async fn get_bearer_stats_by_interface(
 
 /// Updates APN properties on an existing ModemManager bearer.
 pub async fn set_apn_on_bearer(conn: &Connection, req: &SetApnRequest) -> zbus::Result<()> {
+    if crate::platform::is_openwrt() {
+        return Err(zbus::fdo::Error::NotSupported("Use the persisted APN configuration and reconnect CID 1 on Kwrt; editing arbitrary ModemManager bearers is disabled".into()).into());
+    }
     with_serial(async {
         let props_proxy =
             Proxy::new(conn, MM_SERVICE, req.context_path.as_str(), DBUS_PROPERTIES).await?;
@@ -5862,6 +5960,10 @@ fn sanitize_voice_number(phone_number: &str) -> Result<String, String> {
 }
 
 async fn run_direct_at_command(conn: &Connection, command: &str) -> Result<String, String> {
+    if crate::platform::is_openwrt() {
+        let path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
+        return kwrt_mm_at(conn, &path, command).await;
+    }
     let device = at_command_device(conn).await?;
     let command = command.to_string();
     tokio::task::spawn_blocking(move || run_direct_at_command_blocking(&device, &command))
@@ -5875,6 +5977,10 @@ async fn run_direct_at_command_draining(
     conn: &Connection,
     command: &str,
 ) -> Result<String, String> {
+    if crate::platform::is_openwrt() {
+        let path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
+        return kwrt_mm_at(conn, &path, command).await;
+    }
     let device = at_command_device(conn).await?;
     let command = command.to_string();
     tokio::task::spawn_blocking(move || {
@@ -6293,6 +6399,16 @@ pub async fn init_data_connection(
     allow_roaming: bool,
     configured_apn: Option<ApnConfig>,
 ) -> String {
+    if crate::platform::is_openwrt() {
+        let apn = configured_apn.unwrap_or_default();
+        return match kwrt_initialize_data(conn, user_disabled, allow_roaming, &apn).await {
+            Ok(active) => format!(
+                "Kwrt cellular data {} via RG200U CID 1 and netifd",
+                if active { "ready" } else { "disabled" }
+            ),
+            Err(err) => format!("Kwrt cellular data initialization failed: {err}"),
+        };
+    }
     // 设置 NM autoconnect 状态
     if let Ok(profile) = find_nm_modem_connection().await {
         let auto = !user_disabled.load(Ordering::SeqCst);
@@ -6364,6 +6480,15 @@ pub async fn init_data_connection(
 
 /// 启动时确保 NM 有可用的 modem 连接 profile；同时清理旧版本遗留的 unmanaged 配置
 pub async fn ensure_nm_modem_profile() -> String {
+    if crate::platform::is_openwrt() {
+        return match KwrtNetworkConfig::from_env() {
+            Ok(config) => format!(
+                "Using preconfigured netifd profile {} on {}; no persistent network changes",
+                config.network, config.interface
+            ),
+            Err(error) => format!("Kwrt network configuration invalid: {error}"),
+        };
+    }
     // 1. Remove old unmanaged config if it exists
     let legacy_config = "/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf";
     if tokio::fs::metadata(legacy_config).await.is_ok() {
@@ -6419,11 +6544,18 @@ pub async fn ensure_nm_modem_profile() -> String {
 
 /// Public wrapper for handlers to query the NM modem connection profile name
 pub async fn find_nm_modem_connection_pub() -> Result<String, String> {
+    if crate::platform::is_openwrt() {
+        return Ok(KwrtNetworkConfig::from_env()?.network);
+    }
     find_nm_modem_connection().await
 }
 
 /// Public wrapper for handlers to set NM autoconnect
 pub async fn nm_set_autoconnect_pub(profile: &str, enabled: bool) -> Result<(), String> {
+    // The persisted SimAdmin user-disabled flag controls reconnection on Kwrt.
+    if crate::platform::is_openwrt() {
+        return Ok(());
+    }
     nm_set_autoconnect(profile, enabled).await
 }
 
@@ -6471,9 +6603,7 @@ fn parse_nm_connection_runtime_state(output: &str) -> (bool, Vec<String>) {
         .lines()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let profile_active = values
-        .next()
-        .is_some_and(nm_connection_state_is_activated);
+    let profile_active = values.next().is_some_and(nm_connection_state_is_activated);
     let mut devices: Vec<String> = values
         .flat_map(|value| value.split(','))
         .map(str::trim)
@@ -6596,6 +6726,9 @@ async fn nm_set_autoconnect(profile: &str, enabled: bool) -> Result<(), String> 
 }
 
 async fn run_recovery_command(program: &str, args: &[&str]) -> Result<String, String> {
+    if crate::platform::is_openwrt() && program == "systemctl" {
+        return kwrt_service_action(args).await;
+    }
     let output = Command::new(program)
         .args(args)
         .output()
@@ -6623,6 +6756,10 @@ async fn run_recovery_command_owned(
     args: &[String],
     timeout: Duration,
 ) -> Result<String, String> {
+    if crate::platform::is_openwrt() && program == "systemctl" {
+        let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+        return kwrt_service_action(&borrowed).await;
+    }
     let output = tokio::time::timeout(timeout, Command::new(program).args(args).output())
         .await
         .map_err(|_| format!("{program} timed out after {}s", timeout.as_secs()))?
@@ -6716,6 +6853,12 @@ pub async fn restart_baseband(
     allow_roaming: bool,
     configured_apn: Option<ApnConfig>,
 ) -> Result<BasebandRestartResponse, String> {
+    if crate::platform::is_openwrt() {
+        BASEBAND_RESTART_RUNNING.store(false, Ordering::SeqCst);
+        return Err(
+            "Kwrt baseband restart is not enabled; only CID 1 data reconnect is supported".into(),
+        );
+    }
     reset_baseband_restart_progress();
     let _progress_guard = BasebandRestartRunGuard;
     with_serial(async move {
@@ -6736,6 +6879,10 @@ pub async fn power_cycle_sim_for_profile_switch(
     allow_roaming: bool,
     configured_apn: Option<ApnConfig>,
 ) -> Result<BasebandRestartResponse, String> {
+    if crate::platform::is_openwrt() {
+        BASEBAND_RESTART_RUNNING.store(false, Ordering::SeqCst);
+        return Err("SIM power cycling is not enabled on Kwrt; it would also interrupt IMS".into());
+    }
     with_serial(async move {
         power_cycle_sim_for_profile_switch_inner(
             conn,
@@ -6790,7 +6937,8 @@ async fn power_cycle_sim_for_profile_switch_inner(
             "running",
             None,
         );
-        let path = initial_modem_path.unwrap_or_else(|| "/org/freedesktop/ModemManager1/Modem/0".to_string());
+        let path = initial_modem_path
+            .unwrap_or_else(|| "/org/freedesktop/ModemManager1/Modem/0".to_string());
         if let Ok(proxy) = Proxy::new(conn, MM_SERVICE, path.as_str(), MM_MODEM).await {
             let _ = send_mm_at_command(&proxy, "AT+CFUN=0").await;
             tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -6818,12 +6966,8 @@ async fn power_cycle_sim_for_profile_switch_inner(
         }
         // Poll for MM to become inactive instead of a fixed 3s sleep
         for _ in 0..6 {
-            match Command::new("systemctl")
-                .args(["is-active", "--quiet", "ModemManager.service"])
-                .status()
-                .await
-            {
-                Ok(status) if !status.success() => break,
+            match crate::platform::service_is_active("ModemManager").await {
+                Ok(false) => break,
                 _ => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }
@@ -7109,6 +7253,18 @@ pub async fn data_connection_watchdog(
     config: std::sync::Arc<ConfigManager>,
     system_events: std::sync::Arc<SystemEventEmitter>,
 ) {
+    if crate::platform::is_openwrt() {
+        kwrt_data_watchdog(
+            conn,
+            interval_secs,
+            user_disabled,
+            airplane_requested,
+            config,
+            system_events,
+        )
+        .await;
+        return;
+    }
     use crate::iptables::get_iptables_rule_count;
 
     let mut last_log = String::new();
@@ -7256,12 +7412,11 @@ pub async fn data_connection_watchdog(
                                             "长时间 searching，watchdog 已执行深度射频复位",
                                         )
                                         .await;
-                                    "Searching for too long, cycled radio state (deep reset)".to_string()
+                                    "Searching for too long, cycled radio state (deep reset)"
+                                        .to_string()
                                 }
                                 Err(err) => {
-                                    format!(
-                                        "Searching for too long, radio reset failed: {err}"
-                                    )
+                                    format!("Searching for too long, radio reset failed: {err}")
                                 }
                             }
                         } else if searching_count >= SEARCHING_REGISTER_THRESHOLD
@@ -7316,14 +7471,14 @@ pub async fn data_connection_watchdog(
                         failed_state_count += 1;
                         if failed_state_count >= FAILED_STATE_RECOVERY_THRESHOLD {
                             failed_state_count = 0;
-                            warn!(
-                                "Modem permanently stuck in failed state, triggering recovery"
-                            );
+                            warn!("Modem permanently stuck in failed state, triggering recovery");
                             // 若存在 QMI 设备，尝试确保 SIM 卡处于上电状态
                             if let Some(qmi_dev) = find_qmi_device_path() {
                                 let _ = qmicli_sim_power(&qmi_dev, true).await;
                             }
-                            match run_recovery_command("systemctl", &["restart", "ModemManager"]).await {
+                            match run_recovery_command("systemctl", &["restart", "ModemManager"])
+                                .await
+                            {
                                 Ok(_) => {
                                     cellular_problem_active = true;
                                     system_events
@@ -7338,7 +7493,9 @@ pub async fn data_connection_watchdog(
                                     "Modem in failed state, restarted ModemManager".to_string()
                                 }
                                 Err(err) => {
-                                    format!("Modem in failed state, restart ModemManager failed: {err}")
+                                    format!(
+                                        "Modem in failed state, restart ModemManager failed: {err}"
+                                    )
                                 }
                             }
                         } else {
@@ -7407,7 +7564,10 @@ pub async fn data_connection_watchdog(
                                     )
                                     .await
                                     {
-                                        Ok(_) => "Recovered cellular data path through NetworkManager".to_string(),
+                                        Ok(_) => {
+                                            "Recovered cellular data path through NetworkManager"
+                                                .to_string()
+                                        }
                                         Err(err) => {
                                             if !data_activation_failure_active {
                                                 system_events
@@ -7618,4 +7778,342 @@ pub async fn data_connection_watchdog(
             last_log = result;
         }
     }
+}
+
+// Kwrt transport deliberately has no serial-port or shell fallback. ModemManager owns AT.
+struct KwrtTransport<'a> {
+    conn: &'a Connection,
+    modem_path: &'a str,
+}
+
+async fn kwrt_mm_at(conn: &Connection, modem_path: &str, command: &str) -> Result<String, String> {
+    let timeout = if command.starts_with("AT+QNETDEVCTL=") {
+        30
+    } else {
+        10
+    };
+    let context = ModemContext::new(conn, modem_path).map_err(|error| error.to_string())?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(timeout as u64 + 2),
+        context.send_at_command(command, timeout),
+    )
+    .await
+    .map_err(|_| "ModemManager AT command timed out".to_string())??;
+    if output.lines().map(str::trim).any(|line| {
+        line == "ERROR" || line.starts_with("+CME ERROR") || line.starts_with("+CMS ERROR")
+    }) {
+        return Err(format!("Modem rejected AT command: {}", output.trim()));
+    }
+    Ok(output)
+}
+
+#[async_trait::async_trait]
+impl NetworkTransport for KwrtTransport<'_> {
+    async fn at(&self, command: &str) -> Result<String, String> {
+        kwrt_mm_at(self.conn, self.modem_path, command).await
+    }
+    async fn netifd(&self, object: &str, method: &str) -> Result<serde_json::Value, String> {
+        let output = tokio::time::timeout(
+            Duration::from_secs(8),
+            Command::new("ubus")
+                .args(["-S", "call", object, method, "{}"])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| format!("netifd {method} timed out"))?
+        .map_err(|error| format!("Cannot execute ubus: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "netifd {object} {method} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        if output.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(serde_json::json!({}));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Invalid netifd JSON response: {error}"))
+    }
+    async fn profile_config(&self, network: &str) -> Result<serde_json::Value, String> {
+        kwrt_network::read_profile_config(network).await
+    }
+    async fn home_plmn(&self) -> Result<String, String> {
+        let sim_path = get_sim_path(self.conn, self.modem_path).await.map_err(|error| error.to_string())?;
+        if sim_path.is_empty() || sim_path == "/" {
+            return Err("SIM home PLMN unavailable: modem has no SIM object".into());
+        }
+        let value = get_property(self.conn, &sim_path, MM_SIM, "OperatorIdentifier").await
+            .map_err(|error| format!("Cannot read SIM home PLMN: {error}"))?;
+        Ok(extract_string(&value))
+    }
+}
+
+async fn kwrt_data_health(conn: &Connection) -> Result<DataPathHealth, String> {
+    let config = KwrtNetworkConfig::from_env()?;
+    let path = find_modem_path(conn)
+        .await
+        .map_err(|error| error.to_string())?;
+    with_serial(kwrt_network::health(
+        &KwrtTransport {
+            conn,
+            modem_path: &path,
+        },
+        &config,
+    ))
+    .await
+}
+
+async fn kwrt_service_action(args: &[&str]) -> Result<String, String> {
+    let [action, name] = args else {
+        return Err("Unsupported service action on Kwrt".into());
+    };
+    let result = match *action {
+        "restart" => crate::platform::restart_service(name).await,
+        "start" => crate::platform::start_service(name).await,
+        "stop" => crate::platform::stop_service(name).await,
+        _ => return Err("Unsupported service action on Kwrt".into()),
+    };
+    result
+        .map(|_| "ok".into())
+        .map_err(|error| error.to_string())
+}
+
+async fn kwrt_data_watchdog(
+    conn: std::sync::Arc<Connection>,
+    interval_secs: u64,
+    user_disabled: std::sync::Arc<AtomicBool>,
+    airplane_requested: std::sync::Arc<AtomicBool>,
+    config: std::sync::Arc<ConfigManager>,
+    system_events: std::sync::Arc<SystemEventEmitter>,
+) {
+    let mut last_log = String::new();
+    let mut last_attempt: Option<Instant> = None;
+    let mut problem = false;
+    loop {
+        tokio::time::sleep(Duration::from_secs(interval_secs.max(1))).await;
+        if BASEBAND_RESTART_RUNNING.load(Ordering::SeqCst) {
+            continue;
+        }
+        // User intent takes priority even while an externally controlled PDP is still active.
+        let result = if user_disabled.load(Ordering::SeqCst) {
+            last_attempt = None;
+            "Kwrt cellular data disabled by user; not reconnecting".to_string()
+        } else if airplane_requested.load(Ordering::SeqCst) {
+            last_attempt = None;
+            "Kwrt airplane mode requested; not reconnecting".to_string()
+        } else {
+            match get_cellular_data_path_health(&conn).await {
+                Ok(health) if health.data_plane_ready => {
+                    if !config.get_roaming_allowed()
+                        && get_is_roaming_mm(&conn).await.unwrap_or(false)
+                    {
+                        let apn = config.get_apn_config();
+                        match set_data_connection_with_apn(&conn, false, false, Some(&apn)).await {
+                            Ok(()) => "Kwrt roaming disabled; normal-data PDP disconnected".into(),
+                            Err(error) => format!("Kwrt roaming policy disconnect failed: {error}"),
+                        }
+                    } else {
+                        last_attempt = None;
+                        if problem {
+                            system_events
+                                .emit_code(
+                                    system_event_codes::CELLULAR_CONNECTION_RECOVERED,
+                                    system_event_severity::INFO,
+                                    system_event_status::RECOVERED,
+                                    "usb0",
+                                    "蜂窝数据连接已恢复",
+                                )
+                                .await;
+                            problem = false;
+                        }
+                        "Kwrt cellular data healthy on usb0".into()
+                    }
+                }
+                status => {
+                    let reason = match status {
+                        Ok(health) => health
+                            .reason
+                            .unwrap_or_else(|| "Data path unavailable".into()),
+                        Err(error) => error.to_string(),
+                    };
+                    if last_attempt.is_some_and(|at| {
+                        at.elapsed() < Duration::from_secs(DATA_CONNECT_RETRY_COOLDOWN_SECS)
+                    }) {
+                        format!("Kwrt data unavailable ({reason}); recovery cooldown active")
+                    } else {
+                        last_attempt = Some(Instant::now());
+                        let apn = config.get_apn_config();
+                        match kwrt_activate_if_requested(
+                            &conn,
+                            &user_disabled,
+                            &airplane_requested,
+                            config.get_roaming_allowed(),
+                            &apn,
+                        )
+                        .await
+                        {
+                            Ok(true) => "Kwrt cellular data recovered through netifd".into(),
+                            Ok(false) => {
+                                "Kwrt reconnect cancelled by user data/airplane setting".into()
+                            }
+                            Err(error) => {
+                                if !problem {
+                                    system_events
+                                        .emit_code(
+                                            system_event_codes::CELLULAR_ACTIVATION_FAILED,
+                                            system_event_severity::WARNING,
+                                            system_event_status::FAILED,
+                                            "usb0",
+                                            format!("蜂窝数据通路恢复失败: {error}"),
+                                        )
+                                        .await;
+                                    problem = true;
+                                }
+                                format!("Kwrt cellular data recovery failed: {error}")
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if result != last_log {
+            info!(status = %result, "Kwrt data watchdog");
+            last_log = result;
+        }
+    }
+}
+
+fn kwrt_modem_ports_match(ports: &[(String, u32)]) -> bool {
+    // MM_MODEM_PORT_TYPE_NET == 2. A serial port whose name happens to match is insufficient.
+    ports
+        .iter()
+        .any(|(name, port_type)| name == "usb0" && *port_type == 2)
+}
+
+async fn find_kwrt_modem_path(conn: &Connection) -> zbus::Result<String> {
+    KwrtNetworkConfig::from_env().map_err(zbus::fdo::Error::Failed)?;
+    let mut matches = Vec::new();
+    for path in list_modem_paths(conn).await? {
+        let ports = get_property(conn, &path, MM_MODEM, "Ports").await?;
+        let ports = Vec::<(String, u32)>::try_from(ports).map_err(|error| {
+            zbus::fdo::Error::Failed(format!("Invalid ModemManager Ports: {error}"))
+        })?;
+        if kwrt_modem_ports_match(&ports) {
+            let model = extract_string(&get_property(conn, &path, MM_MODEM, "Model").await?);
+            if !model.to_ascii_uppercase().contains("RG200U") {
+                return Err(no_modem_error(format!(
+                    "usb0 belongs to unsupported modem model {model}; expected Quectel RG200U"
+                )));
+            }
+            matches.push(path);
+        }
+    }
+    if matches.len() != 1 {
+        return Err(no_modem_error(format!("Expected exactly one ModemManager device owning usb0, found {}; no other modem will be selected", matches.len())));
+    }
+    Ok(matches.remove(0))
+}
+
+#[cfg(test)]
+mod kwrt_binding_tests {
+    use super::*;
+    #[test]
+    fn modem_binding_requires_usb0_net_port() {
+        assert!(kwrt_modem_ports_match(&[
+            ("ttyUSB2".into(), 3),
+            ("usb0".into(), 2)
+        ]));
+        assert!(!kwrt_modem_ports_match(&[("eth1".into(), 2)]));
+        assert!(!kwrt_modem_ports_match(&[("usb1".into(), 2)]));
+        assert!(!kwrt_modem_ports_match(&[("usb0".into(), 3)]));
+    }
+}
+
+async fn kwrt_check_data_owner(conn: &Connection, path: &str) -> Result<(), String> {
+    // An active MM-owned normal-data bearer would conflict with the vendor NCM control path.
+    // Initial/IMS bearers are read only and never disconnected.
+    for bearer in known_bearer_paths(conn, path)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        let props = get_all_properties(conn, &bearer, MM_BEARER)
+            .await
+            .map_err(|error| error.to_string())?;
+        let connected = props
+            .get("Connected")
+            .and_then(|value| bool::try_from(value.clone()).ok())
+            .unwrap_or(false);
+        if !connected {
+            continue;
+        }
+        let settings = simple_connect_settings_from_bearer_props(&props);
+        if !settings.apn.as_deref().is_some_and(is_isolated_special_apn) {
+            return Err("An active ModemManager data bearer owns the modem; stop that connection before using the Kwrt NCM/netifd adapter".into());
+        }
+    }
+    Ok(())
+}
+
+async fn kwrt_activate_if_requested(
+    conn: &Connection,
+    user_disabled: &AtomicBool,
+    airplane_requested: &AtomicBool,
+    allow_roaming: bool,
+    apn: &ApnConfig,
+) -> Result<bool, String> {
+    let config = KwrtNetworkConfig::from_env()?;
+    let path = find_modem_path(conn)
+        .await
+        .map_err(|error| error.to_string())?;
+    with_serial(async {
+        // Recheck after obtaining the same lock used by the user's disconnect command.
+        if user_disabled.load(Ordering::SeqCst) || airplane_requested.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        kwrt_check_data_owner(conn, &path).await?;
+        kwrt_network::set_active(
+            &KwrtTransport {
+                conn,
+                modem_path: &path,
+            },
+            &config,
+            true,
+            allow_roaming,
+            apn,
+        )
+        .await?;
+        Ok(true)
+    })
+    .await
+}
+
+async fn kwrt_initialize_data(
+    conn: &Connection,
+    user_disabled: &AtomicBool,
+    allow_roaming: bool,
+    apn: &ApnConfig,
+) -> Result<bool, String> {
+    let config = KwrtNetworkConfig::from_env()?;
+    let path = find_modem_path(conn)
+        .await
+        .map_err(|error| error.to_string())?;
+    with_serial(async {
+        // Startup runs asynchronously; honor the latest user intent after acquiring the lock.
+        let active = !user_disabled.load(Ordering::SeqCst);
+        kwrt_check_data_owner(conn, &path).await?;
+        kwrt_network::set_active(
+            &KwrtTransport {
+                conn,
+                modem_path: &path,
+            },
+            &config,
+            active,
+            allow_roaming,
+            apn,
+        )
+        .await?;
+        Ok(active)
+    })
+    .await
 }

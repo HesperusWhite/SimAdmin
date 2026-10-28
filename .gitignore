@@ -28,3 +28,6 @@ tests/
 build/
 TODO.md
 TODO-VOLTE.md
+# 保留通知投递的源码集成测试
+!crates/simadmin-notify/tests/
+!crates/simadmin-notify/tests/*.rs

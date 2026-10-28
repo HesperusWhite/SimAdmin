@@ -27,6 +27,7 @@ use zbus::Connection;
 mod auth;
 mod automation;
 mod backup;
+mod call_forwarding;
 mod cell_lock_store;
 mod config;
 mod db;
@@ -36,12 +37,16 @@ mod esim;
 mod handlers;
 mod hub_agent;
 mod iptables;
+mod kwrt_network;
 mod models;
 mod modem_manager;
+mod modem_probe;
 mod modem_recovery;
 mod notification;
 mod notification_queue;
 mod ota;
+mod platform;
+mod preflight;
 mod serial;
 mod sms_listener;
 mod state;
@@ -66,6 +71,9 @@ use system_event::{
 
 /// 获取二进制文件同级目录下的 www 目录路径
 fn get_www_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("SIMADMIN_WWW_DIR") {
+        return PathBuf::from(path);
+    }
     // 获取当前可执行文件的路径
     let exe_path = std::env::current_exe().expect("Failed to get executable path");
 
@@ -251,6 +259,10 @@ struct Cli {
 enum CliCommand {
     /// 启动 Web 管理服务
     Serve(ServeArgs),
+    /// 只读检查运行依赖，输出 JSON；不启动服务或修改设备
+    Doctor,
+    /// 通过 D-Bus 只读验证模块、网络、短信和呼转查询；不启动 Web 服务
+    ModemProbe,
     /// 管理 Web 登录认证（用于 SSH 本机恢复）
     Auth {
         #[command(subcommand)]
@@ -297,6 +309,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 处理非服务子命令
+    if let Some(CliCommand::ModemProbe) = &cli.command {
+        return modem_probe::run().await;
+    }
+    if let Some(CliCommand::Doctor) = &cli.command {
+        let report = preflight::inspect().await;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.ready {
+            anyhow::bail!("运行依赖尚未就绪，详见诊断结果");
+        }
+        return Ok(());
+    }
     if let Some(CliCommand::ExtractZip { archive, target }) = &cli.command {
         return run_extract_zip(archive, target);
     }
@@ -318,7 +341,9 @@ async fn main() -> Result<()> {
     let bind_addr = display_bind_addr(&args.host, args.port);
 
     // 确保 ModemManager 已提权以支持 AT 指令读取短信中心
-    ensure_modemmanager_debug_override();
+    if !platform::is_openwrt() {
+        ensure_modemmanager_debug_override();
+    }
     modem_recovery::ensure_modem_recovery_assets_installed();
 
     // Connect to system D-Bus
@@ -347,7 +372,7 @@ async fn main() -> Result<()> {
     let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
 
     let nm_result = ensure_nm_modem_profile().await;
-    tracing::info!(result = %nm_result, "NetworkManager modem profile setup completed");
+    tracing::info!(result = %nm_result, "Cellular network setup completed");
 
     // 初始化通知发送器
     let notification_sender = Arc::new(NotificationSender::new(

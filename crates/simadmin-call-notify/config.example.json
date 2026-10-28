@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "modem_model": "RG200U-CN",
+  "network_device": "usb0",
+  "poll_interval_ms": 1500,
+  "data_dir": "/opt/simadmin/data/call-notify",
+  "secret_file": "/etc/codex-telegram-bridge/simadmin-rx.key"
+}

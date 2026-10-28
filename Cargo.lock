@@ -1853,6 +1853,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "simadmin-call-notify"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "futures-util",
+ "hmac",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "simadmin-notify",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "zbus",
+]
+
+[[package]]
 name = "simadmin-device-core"
 version = "0.1.0"
 dependencies = [

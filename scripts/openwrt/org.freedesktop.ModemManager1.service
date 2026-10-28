@@ -1,0 +1,5 @@
+# MM must be started explicitly by the restricted procd supervisor.
+[D-BUS Service]
+Name=org.freedesktop.ModemManager1
+Exec=/bin/false
+User=root

@@ -1,0 +1,5 @@
+# OpenWrt MM's generic rules parser accepts exactly one property assignment per
+# line. Keep the physical USB ID, kernel port and interface number on every rule.
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB2", ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0900", ATTRS{bInterfaceNumber}=="04", ENV{ID_MM_DEVICE_PROCESS}="1"
+ACTION=="add", SUBSYSTEM=="tty", KERNEL=="ttyUSB2", ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0900", ATTRS{bInterfaceNumber}=="04", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1"
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="usb0", ATTRS{idVendor}=="2c7c", ATTRS{idProduct}=="0900", ATTRS{bInterfaceNumber}=="00", ENV{ID_MM_DEVICE_PROCESS}="1"

@@ -691,10 +691,14 @@ pub struct SetCallSettingRequest {
 #[derive(Debug, Serialize, Default)]
 pub struct CallForwardingResponse {
     pub voice_unconditional: String,
+    pub voice_unconditional_enabled: bool,
     pub voice_busy: String,
+    pub voice_busy_enabled: bool,
     pub voice_no_reply: String,
+    pub voice_no_reply_enabled: bool,
     pub voice_no_reply_timeout: u16,
     pub voice_not_reachable: String,
+    pub voice_not_reachable_enabled: bool,
     pub forwarding_flag_on_sim: bool,
 }
 
@@ -703,6 +707,8 @@ pub struct SetCallForwardingRequest {
     pub forward_type: String,
     pub number: String,
     pub timeout: Option<u16>,
+    /// Omitted for legacy clients: a nonempty number enables forwarding; empty disables it.
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Default)]

@@ -1352,6 +1352,9 @@ async fn wlan_profile_ssid(uuid: &str) -> Option<String> {
 }
 
 async fn run_nmcli(args: &[&str]) -> Result<String, String> {
+    if crate::platform::is_openwrt() {
+        return Err("Kwrt 的 Wi-Fi 请通过 LuCI 管理；此接口需要 NetworkManager".into());
+    }
     let output = tokio::process::Command::new("nmcli")
         .env("LANG", "C.UTF-8")
         .env("LC_ALL", "C.UTF-8")
@@ -1460,13 +1463,13 @@ mod tests {
                 scope: "private".to_string(),
             },
             IpAddress {
-                address: "2408::64".to_string(),
+                address: "2001:db8::64".to_string(),
                 prefix_len: 64,
                 ip_type: "ipv6".to_string(),
                 scope: "public".to_string(),
             },
             IpAddress {
-                address: "2408::128".to_string(),
+                address: "2001:db8::128".to_string(),
                 prefix_len: 128,
                 ip_type: "ipv6".to_string(),
                 scope: "public".to_string(),
@@ -1479,7 +1482,7 @@ mod tests {
             .map(|addr| addr.address.as_str())
             .collect();
 
-        assert_eq!(candidate_addresses, vec!["2408::128", "2408::64"]);
+        assert_eq!(candidate_addresses, vec!["2001:db8::128", "2001:db8::64"]);
     }
 
     fn test_interface(
@@ -1519,6 +1522,9 @@ mod tests {
     }
 
     fn public_ipv6(address: &str) -> IpAddress {
+        address
+            .parse::<std::net::Ipv6Addr>()
+            .expect("IPv6 fixture must be valid");
         IpAddress {
             address: address.to_string(),
             prefix_len: 64,
@@ -1530,7 +1536,7 @@ mod tests {
     #[test]
     fn ddns_interface_selection_prefers_wireless_default_route() {
         let interfaces = vec![
-            test_interface("wwan0", false, true, true, true, vec![ipv4("10.11.242.67")]),
+            test_interface("wwan0", false, true, true, true, vec![ipv4("192.0.2.67")]),
             test_interface(
                 "wlp1s0",
                 true,
@@ -1559,13 +1565,13 @@ mod tests {
                 false,
                 vec![ipv4("192.168.68.1")],
             ),
-            test_interface("wwan0", false, true, true, true, vec![ipv4("10.11.242.67")]),
+            test_interface("eth1", false, false, true, true, vec![ipv4("192.0.2.67")]),
         ];
 
         let selected =
             preferred_interface_for_family(&interfaces, NetworkAddressFamily::Ipv4).unwrap();
 
-        assert_eq!(selected.name, "wwan0");
+        assert_eq!(selected.name, "eth1");
     }
 
     #[test]
@@ -1577,22 +1583,52 @@ mod tests {
                 false,
                 false,
                 false,
-                vec![public_ipv6("2408::68")],
+                vec![public_ipv6("2001:db8::68")],
             ),
             test_interface(
-                "wwan0",
+                "eth1",
+                false,
+                false,
                 false,
                 true,
-                false,
-                true,
-                vec![public_ipv6("2408::cell")],
+                vec![public_ipv6("2001:db8::ce11")],
             ),
         ];
 
         let selected =
             preferred_interface_for_family(&interfaces, NetworkAddressFamily::Ipv6).unwrap();
 
-        assert_eq!(selected.name, "wwan0");
+        assert_eq!(selected.name, "eth1");
+    }
+
+    #[test]
+    fn ddns_interface_selection_preserves_wired_priority_over_cellular_default() {
+        let interfaces = vec![
+            test_interface(
+                "usb0",
+                false,
+                true,
+                true,
+                true,
+                vec![ipv4("192.0.2.28"), public_ipv6("2001:db8::ce11")],
+            ),
+            test_interface(
+                "eth1",
+                false,
+                false,
+                false,
+                false,
+                vec![ipv4("198.51.100.3"), public_ipv6("2001:db8::3")],
+            ),
+        ];
+        for family in [NetworkAddressFamily::Ipv4, NetworkAddressFamily::Ipv6] {
+            assert_eq!(
+                preferred_interface_for_family(&interfaces, family)
+                    .unwrap()
+                    .name,
+                "eth1"
+            );
+        }
     }
 
     #[test]
@@ -1604,7 +1640,7 @@ mod tests {
                 true,
                 false,
                 true,
-                vec![public_ipv6("2408::cell")],
+                vec![public_ipv6("2001:db8::ce11")],
             ),
             test_interface(
                 "wlan0",
@@ -1612,7 +1648,7 @@ mod tests {
                 false,
                 false,
                 false,
-                vec![public_ipv6("240e::wifi")],
+                vec![public_ipv6("2001:db8:1::1f1")],
             ),
         ];
 
@@ -1631,7 +1667,7 @@ mod tests {
                 true,
                 false,
                 true,
-                vec![public_ipv6("2409::ims")],
+                vec![public_ipv6("2001:db8:2::1")],
             ),
             test_interface(
                 "wwan0",
@@ -1639,7 +1675,7 @@ mod tests {
                 true,
                 false,
                 false,
-                vec![public_ipv6("2408::cell")],
+                vec![public_ipv6("2001:db8::ce11")],
             ),
         ];
 

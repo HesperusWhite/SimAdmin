@@ -29,14 +29,14 @@ use crate::{
         cached_smsc_for_identity, current_sim_identity, find_nm_modem_connection_pub,
         get_airplane_mode, get_band_lock_status, get_baseband_restart_progress, get_call_by_path,
         get_call_settings, get_cell_location, get_cells_data, get_cellular_data_path_health,
-        get_data_connection_status, get_device_info_data, get_is_roaming_mm,
-        get_network_info_data, get_operators_list,
-        get_radio_mode, get_signal_strength, get_sim_info_data_with_cache, hangup_all_calls,
-        hangup_call, list_apn_contexts, list_current_calls, make_call, nm_set_autoconnect_pub,
-        power_cycle_sim_for_profile_switch, refresh_sim_details_background, register_operator_auto,
-        register_operator_manual, restart_baseband, scan_operators, send_sms, set_airplane_mode,
-        set_apn_on_bearer, set_band_lock, set_call_waiting, set_data_connection_with_apn,
-        set_radio_mode, sim_details_cache_missing, start_cell_monitoring, stop_cell_monitoring,
+        get_data_connection_status, get_device_info_data, get_is_roaming_mm, get_network_info_data,
+        get_operators_list, get_radio_mode, get_signal_strength, get_sim_info_data_with_cache,
+        hangup_all_calls, hangup_call, list_apn_contexts, list_current_calls, make_call,
+        nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch, refresh_sim_details_background,
+        register_operator_auto, register_operator_manual, restart_baseband, scan_operators,
+        send_sms, set_airplane_mode, set_apn_on_bearer, set_band_lock, set_call_waiting,
+        set_data_connection_with_apn, set_radio_mode, sim_details_cache_missing,
+        start_cell_monitoring, stop_cell_monitoring,
     },
     state::AppState,
     system_event::{
@@ -241,7 +241,9 @@ fn optional_profile_cache_value(value: &Option<String>) -> Option<String> {
 fn profile_cache_entry(profile: &EsimProfile, eid: Option<&str>) -> EsimProfileCacheEntry {
     EsimProfileCacheEntry {
         iccid: profile.iccid.trim().to_string(),
-        eid: eid.map(|s| s.trim().to_string()).or_else(|| profile.eid.clone()),
+        eid: eid
+            .map(|s| s.trim().to_string())
+            .or_else(|| profile.eid.clone()),
         name: profile_cache_value(&profile.name),
         provider: profile_cache_value(&profile.provider),
         state: profile_cache_value(&profile.state),
@@ -1472,7 +1474,11 @@ pub async fn rename_esim_profile_handler(
             )),
         );
     }
-    match app.esim_supervisor.rename_profile(iccid.clone(), name.clone()).await {
+    match app
+        .esim_supervisor
+        .rename_profile(iccid.clone(), name.clone())
+        .await
+    {
         Ok(data) => {
             if esim_command_succeeded(&data) {
                 if let Ok(Some(mut entry)) = app.database.get_esim_profile_cache(&iccid) {
@@ -1568,7 +1574,12 @@ pub async fn download_esim_profile_handler(
     match app.esim_supervisor.download_profile(payload.clone()).await {
         Ok(data) => {
             if esim_command_succeeded(&data) {
-                let current_eid = app.database.latest_esim_euicc_cache().ok().flatten().map(|e| e.eid);
+                let current_eid = app
+                    .database
+                    .latest_esim_euicc_cache()
+                    .ok()
+                    .flatten()
+                    .map(|e| e.eid);
                 let downloaded_iccid;
                 // Attempt to recursively find the downloaded profile details in lpac's response
                 let profile_val = data.data.clone().unwrap_or(serde_json::Value::Null);
@@ -1748,7 +1759,12 @@ pub async fn download_esim_profile_handler(
 
                 if is_refused {
                     info!("MatchingID is refused, attempting to bind matching info to the profile if it exists");
-                    let current_eid = app.database.latest_esim_euicc_cache().ok().flatten().map(|e| e.eid);
+                    let current_eid = app
+                        .database
+                        .latest_esim_euicc_cache()
+                        .ok()
+                        .flatten()
+                        .map(|e| e.eid);
                     let mut cached_fallback_iccid = None;
                     if let Ok(profiles_resp) = app.esim_supervisor.get_profiles().await {
                         for p in profiles_resp.profiles {
@@ -2809,6 +2825,14 @@ pub async fn set_data_status(
     Json(payload): Json<DataConnectionRequest>,
 ) -> impl IntoResponse {
     let previous_active = !app.data_user_disabled.load(Ordering::SeqCst);
+    // Publish an OFF request before waiting for the modem lock. Startup/watchdog
+    // must see it even if disconnecting or persisting the request later fails.
+    let disable_save_error = if !payload.active {
+        app.data_user_disabled.store(true, Ordering::SeqCst);
+        app.config_manager.set_data_enabled(false).err()
+    } else {
+        None
+    };
     let allow_roaming = app.config_manager.get_roaming_allowed();
     let apn_config = app.config_manager.get_apn_config();
     match set_data_connection_with_apn(
@@ -2820,17 +2844,22 @@ pub async fn set_data_status(
     .await
     {
         Ok(_) => {
-            if let Err(err) = app.config_manager.set_data_enabled(payload.active) {
+            app.data_user_disabled
+                .store(!payload.active, Ordering::SeqCst);
+            let save_result = if payload.active {
+                app.config_manager.set_data_enabled(true)
+            } else {
+                disable_save_error.map_or(Ok(()), Err)
+            };
+            if let Err(err) = save_result {
                 return (
                     StatusCode::OK,
                     Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                        "Failed to save data switch state: {}",
+                        "Data switch applied, but failed to save its state: {}",
                         err
                     ))),
                 );
             }
-            app.data_user_disabled
-                .store(!payload.active, Ordering::SeqCst);
             if previous_active != payload.active {
                 app.system_event_emitter
                     .emit_code(
@@ -2869,10 +2898,13 @@ pub async fn set_data_status(
         }
         Err(e) => (
             StatusCode::OK,
-            Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
+            Json(ApiResponse::<DataConnectionResponse>::error(
+                if payload.active {
+                    format!("Failed: {e}")
+                } else {
+                    format!("关闭蜂窝数据失败，自动重拨已暂停: {e}")
+                },
+            )),
         ),
     }
 }
@@ -3259,12 +3291,12 @@ pub async fn delete_sms_message_handler(
             let _ = db.enqueue_sms_deleted(&[format!("sms-local-{}", id)]);
             crate::hub_agent::hub_business_wakeup().notify_one();
             (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "SMS deleted",
-                json!({ "deleted": deleted }),
-            )),
-        )
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "SMS deleted",
+                    json!({ "deleted": deleted }),
+                )),
+            )
         }
         Err(e) => (
             StatusCode::OK,
@@ -3278,12 +3310,18 @@ pub async fn delete_sms_conversation_handler(
     State(app): State<AppState>,
     Path(phone_number): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    let phone_ids = app.database.get_sms_ids_by_phone(&phone_number).unwrap_or_default();
+    let phone_ids = app
+        .database
+        .get_sms_ids_by_phone(&phone_number)
+        .unwrap_or_default();
     match app.database.delete_sms_conversation(&phone_number) {
         Ok(deleted) => {
             schedule_sms_db_maintenance(&app, deleted);
             if !phone_ids.is_empty() {
-                let items: Vec<String> = phone_ids.into_iter().map(|id| format!("sms-local-{}", id)).collect();
+                let items: Vec<String> = phone_ids
+                    .into_iter()
+                    .map(|id| format!("sms-local-{}", id))
+                    .collect();
                 let _ = app.database.enqueue_sms_deleted(&items);
                 crate::hub_agent::hub_business_wakeup().notify_one();
             }
@@ -3324,7 +3362,10 @@ pub async fn delete_sms_batch_handler(
         Ok(deleted) => {
             schedule_sms_db_maintenance(&app, deleted);
             if !all_ids.is_empty() {
-                let items: Vec<String> = all_ids.into_iter().map(|id| format!("sms-local-{}", id)).collect();
+                let items: Vec<String> = all_ids
+                    .into_iter()
+                    .map(|id| format!("sms-local-{}", id))
+                    .collect();
                 let _ = app.database.enqueue_sms_deleted(&items);
                 crate::hub_agent::hub_business_wakeup().notify_one();
             }
@@ -3686,25 +3727,23 @@ pub async fn set_call_volume_handler(
     )
 }
 
-pub async fn get_call_forwarding_handler() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(ApiResponse::<CallForwardingResponse>::error(
-            "Call forwarding is not exposed by ModemManager on this backend",
-        )),
-    )
+pub async fn get_call_forwarding_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
+    let response = match crate::call_forwarding::get_call_forwarding(&conn).await {
+        Ok(data) => ApiResponse::success_with_message("Success", data),
+        Err(error) => ApiResponse::error(error),
+    };
+    (StatusCode::OK, Json(response))
 }
 
 pub async fn set_call_forwarding_handler(
+    State(conn): State<Arc<Connection>>,
     Json(payload): Json<SetCallForwardingRequest>,
 ) -> impl IntoResponse {
-    let _ = (payload.forward_type, payload.number, payload.timeout);
-    (
-        StatusCode::OK,
-        Json(ApiResponse::<CallForwardingResponse>::error(
-            "Call forwarding is not exposed by ModemManager on this backend",
-        )),
-    )
+    let response = match crate::call_forwarding::set_call_forwarding(&conn, payload).await {
+        Ok(data) => ApiResponse::success_with_message("Call forwarding updated", data),
+        Err(error) => ApiResponse::error(error),
+    };
+    (StatusCode::OK, Json(response))
 }
 
 pub async fn get_ims_status_handler() -> impl IntoResponse {
@@ -4049,12 +4088,8 @@ pub async fn run_safe_os_reboot_sequence(
 
     // 尽力尝试让调制解调器优雅脱网并下电，使用 any 适配动态 Modem 序号，且设为允许容错（避免因已脱网或序号漂移产生非预期警告）
     let _ = run_reboot_prep_command("disable modem radio", "mmcli", &["-m", "any", "-d"], true);
-    if let Some(message) = run_reboot_prep_command(
-        "stop ModemManager IPC service",
-        "systemctl",
-        &["stop", "ModemManager"],
-        false,
-    ) {
+    if let Err(err) = crate::platform::stop_service("ModemManager").await {
+        let message = format!("停止 ModemManager 失败: {err}");
         system_events
             .emit_code(
                 system_event_codes::SYSTEM_SERVICE_REBOOT_PREP_FAILED,
@@ -4208,9 +4243,9 @@ pub async fn restart_service_handler(State(app): State<AppState>) -> impl IntoRe
         .await;
     tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        let _ = Command::new("systemctl")
-            .args(["restart", "simadmin"])
-            .output();
+        if let Err(err) = crate::platform::restart_service("simadmin").await {
+            error!(error = %err, "Failed to restart SimAdmin service");
+        }
     });
     (
         StatusCode::OK,

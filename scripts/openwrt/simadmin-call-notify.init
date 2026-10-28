@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+START=99
+STOP=09
+USE_PROCD=1
+start_service() {
+    local enabled config_file
+    config_load simadmin_call_notify
+    config_get_bool enabled main enabled 0
+    [ "$enabled" = 1 ] || return 0
+    config_get config_file main config '/etc/simadmin-call-notify/config.json'
+    [ -r "$config_file" ] || return 1
+    procd_open_instance main
+    procd_set_param command /usr/bin/simadmin-call-notify run --config "$config_file"
+    procd_set_param env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+    procd_set_param respawn 3600 5 5
+    procd_set_param term_timeout 10
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param file "$config_file"
+    procd_close_instance
+}

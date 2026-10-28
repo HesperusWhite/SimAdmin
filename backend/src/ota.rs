@@ -35,6 +35,19 @@ const BUILTIN_PROXY_PREFIXES: [&str; 3] = [
 ];
 pub const MAX_OTA_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Upstream OTA archives do not contain the local OpenWrt integration.
+fn ensure_ota_supported_for_platform(openwrt: bool) -> Result<(), String> {
+    if openwrt {
+        Err("OTA is disabled on OpenWrt/Kwrt: install a reviewed local adaptation package instead".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_ota_supported() -> Result<(), String> {
+    ensure_ota_supported_for_platform(crate::platform::is_openwrt())
+}
+
 struct StagingCleanupGuard {
     preserve: bool,
 }
@@ -450,6 +463,7 @@ pub async fn fetch_latest_github_release(
     proxy_prefix: &str,
     include_builtin_proxies: bool,
 ) -> Result<OtaLatestReleaseResponse, String> {
+    ensure_ota_supported()?;
     let mut last_error = String::new();
     for url in ota_request_urls(LATEST_RELEASE_API, proxy_prefix, include_builtin_proxies) {
         match client
@@ -490,6 +504,9 @@ pub async fn check_and_notify_version_update(
     config_manager: Arc<ConfigManager>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<(), String> {
+    if crate::platform::is_openwrt() {
+        return Ok(());
+    }
     let update_config = config_manager.get_version_update_notifications();
     if !update_config.enabled || !notification_sender.has_version_update_targets() {
         return Ok(());
@@ -553,6 +570,7 @@ pub async fn download_ota_asset_bytes(
     include_builtin_proxies: bool,
     asset: &OtaReleaseAsset,
 ) -> Result<Vec<u8>, String> {
+    ensure_ota_supported()?;
     if asset.size > MAX_OTA_BYTES {
         return Err(format!(
             "OTA asset is too large: {} bytes exceeds {} bytes",
@@ -619,6 +637,7 @@ fn read_pending_meta() -> Option<OtaMeta> {
 
 /// 处理上传的 OTA 包（支持 tar.gz 和 zip 格式）
 pub fn handle_ota_upload(data: &[u8]) -> Result<OtaUploadResponse, String> {
+    ensure_ota_supported()?;
     // 清理并创建临时目录
     let _ = fs::remove_dir_all(OTA_STAGING_DIR);
     fs::create_dir_all(OTA_STAGING_DIR)
@@ -846,6 +865,7 @@ fn beijing_offset() -> FixedOffset {
 
 /// 应用 OTA 更新
 pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {
+    ensure_ota_supported()?;
     let meta = read_pending_meta().ok_or_else(|| "No pending update".to_string())?;
     let validation = match validate_ota_package(&meta) {
         Ok(validation) => validation,
@@ -1066,6 +1086,13 @@ fn fix_file_permissions() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openwrt_rejects_upstream_ota_before_io() {
+        let error = ensure_ota_supported_for_platform(true).unwrap_err();
+        assert!(error.contains("disabled on OpenWrt/Kwrt"));
+        assert!(ensure_ota_supported_for_platform(false).is_ok());
+    }
 
     #[test]
     fn compares_release_tag_versions() {

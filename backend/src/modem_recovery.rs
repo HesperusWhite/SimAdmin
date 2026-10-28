@@ -62,6 +62,10 @@ fn atomic_write_file(target_path: &Path, content: &str, mode: u32) -> std::io::R
 /// 检查并确保宿主机上的开机看门狗脚本、systemd 单元与定时器已同步最新内嵌版本并处于启用状态
 #[cfg(unix)]
 pub fn ensure_modem_recovery_assets_installed() {
+    if crate::platform::is_openwrt() {
+        info!("OpenWrt uses procd supervision; skipping systemd recovery assets");
+        return;
+    }
     let script_target = Path::new(SCRIPT_PATH);
     let mut script_updated = false;
 
